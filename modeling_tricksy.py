@@ -212,15 +212,7 @@ class OPTDiskWeights:
         print(f'loading memmap weights for {self.model_name}')
         self.memmap_weights = { key: self.load_memmap_weight(key) for key in self.state_dict.keys() }
 
-    # def load_full_weight(self, key: str):
-    #     return torch.load(f'{self.weight_path}{key}').to(torch.float16)
-
     def load_memmap_weight(self, key: str):
-        # if key in self.memmap_weights:
-        #     return self.memmap_weights[key]
-        
-        # self.memmap_weights[key] = torch.from_numpy(np.memmap(f'{self.weight_path}{key}', dtype='float16', mode='r', shape=(self.state_dict[key].shape)))
-        # return self.memmap_weights[key]
         return torch.from_numpy(np.memmap(f'{self.weight_path}{key}', dtype='float16', mode='r', shape=(self.state_dict[key].shape)))
 
     def add_weights(self, weights: List[Tuple[str, torch.Size]]):
@@ -310,6 +302,7 @@ class TricksyContext:
         self.load_weight_stream = torch.cuda.Stream()
         self.layer = 0
         self.is_prompt_phase = True
+        self.forward_times = []
 
 class TricksyLayer:
     def __call__(self, *args: Any, **kwds: Any) -> Any:
@@ -350,7 +343,6 @@ class TricksyOPTLearnedPositionalEmbedding(TricksyLayer):
     
     def forward(self, attention_mask: torch.LongTensor, past_key_values_length: int = 0):
         """`input_ids_shape` is expected to be [bsz x seqlen]."""
-        print(f'past key values length: {past_key_values_length}')
         attention_mask = attention_mask.long()
         # create positions depending on attention_mask
         positions = (torch.cumsum(attention_mask, dim=1).type_as(attention_mask) * attention_mask).long() - 1
@@ -358,8 +350,6 @@ class TricksyOPTLearnedPositionalEmbedding(TricksyLayer):
         positions = positions[:, past_key_values_length:]
 
         out = F.embedding(positions + self.offset, self.weight)
-        # if self.tricksy_context.is_prompt_phase:
-        #     self.weight = None
         return out
 
 class TricksyOPTAttention(OPTAttention, TricksyLayer):
@@ -412,24 +402,32 @@ class TricksyOPTAttention(OPTAttention, TricksyLayer):
         self.index_cache = SparseAttentionCache(cpu_cached_head_indices=cpu_random_head_indices, gpu_cached_head_indices=gpu_random_head_indices)
 
         self.catted_weights = self.catted_biases = self.out_proj_bias = self.layer_norm_weight = self.layer_norm_bias = None
+        self.qw = self.kw = self.vw = self.ow = self.qb = self.kb = self.vb = None
         self.q_proj = lambda x: F.linear(
             x,
-            self.catted_weights[:, :self.head_dim, :].reshape(self.head_dim * self.catted_weights.size(0), self.config.hidden_size),
-            self.catted_biases[:, 0, :].reshape(self.head_dim * self.catted_biases.size(0))
+            # self.catted_weights[:, :self.head_dim, :].reshape(self.head_dim * self.catted_weights.size(0), self.config.hidden_size),
+            # self.catted_biases[:, 0, :].reshape(self.head_dim * self.catted_biases.size(0))
+            self.qw,
+            self.qb
         )
         self.k_proj = lambda x: F.linear(
             x,
-            self.catted_weights[:, self.head_dim:self.head_dim * 2, :].reshape(self.head_dim * self.catted_weights.size(0), self.config.hidden_size),
-            self.catted_biases[:, 1, :].reshape(self.head_dim * self.catted_biases.size(0))
+            # self.catted_weights[:, self.head_dim:self.head_dim * 2, :].reshape(self.head_dim * self.catted_weights.size(0), self.config.hidden_size),
+            # self.catted_biases[:, 1, :].reshape(self.head_dim * self.catted_biases.size(0))
+            self.kw,
+            self.kb
         )
         self.v_proj = lambda x: F.linear(
             x,
-            self.catted_weights[:, self.head_dim * 2:self.head_dim * 3, :].reshape(self.head_dim * self.catted_weights.size(0), self.config.hidden_size),
-            self.catted_biases[:, 2, :].reshape(self.head_dim * self.catted_biases.size(0))
+            # self.catted_weights[:, self.head_dim * 2:self.head_dim * 3, :].reshape(self.head_dim * self.catted_weights.size(0), self.config.hidden_size),
+            # self.catted_biases[:, 2, :].reshape(self.head_dim * self.catted_biases.size(0))
+            self.vw,
+            self.vb
         )
         self.out_proj = lambda x: F.linear(
             x,
-            self.catted_weights[:, self.head_dim * 3:, :].reshape(self.head_dim * self.catted_weights.size(0), self.config.hidden_size).T,
+            # self.catted_weights[:, self.head_dim * 3:, :].reshape(self.head_dim * self.catted_weights.size(0), self.config.hidden_size).T,
+            self.ow,
             self.out_proj_bias,
         )
         self.layer_norm = lambda x: F.layer_norm(x, (self.config.hidden_size,), self.layer_norm_weight, self.layer_norm_bias)
@@ -456,10 +454,16 @@ class TricksyOPTAttention(OPTAttention, TricksyLayer):
                 ],
                 tricksy_context.load_weight_stream,
             )
-            # print(f'Loaded full attention weights in {time.time() - start} seconds')
-            # proc = psutil.Process()
-            # print(f'num open files: {len(proc.open_files())}')
-            # print(f'new indices: {tricksy_context.indices.head_indices_buffer_cpu}')
+            self.qw = self.catted_weights[:, :self.head_dim, :].reshape(self.head_dim * self.catted_weights.size(0), self.config.hidden_size).contiguous()
+            self.kw = self.catted_weights[:, self.head_dim:self.head_dim * 2, :].reshape(self.head_dim * self.catted_weights.size(0), self.config.hidden_size).contiguous()
+            self.vw = self.catted_weights[:, self.head_dim * 2:self.head_dim * 3, :].reshape(self.head_dim * self.catted_weights.size(0), self.config.hidden_size).contiguous()
+            self.ow = self.catted_weights[:, self.head_dim * 3:, :].reshape(self.head_dim * self.catted_weights.size(0), self.config.hidden_size).t().contiguous()
+            self.catted_weights = None
+
+            self.qb = self.catted_biases[:, 0, :].reshape(self.head_dim * self.catted_biases.size(0)).contiguous()
+            self.kb = self.catted_biases[:, 1, :].reshape(self.head_dim * self.catted_biases.size(0)).contiguous()
+            self.vb = self.catted_biases[:, 2, :].reshape(self.head_dim * self.catted_biases.size(0)).contiguous()
+            self.catted_biases = None
 
             if self.tricksy_config.min_head_sparsity_gpu == 1:
                 return
@@ -486,10 +490,6 @@ class TricksyOPTAttention(OPTAttention, TricksyLayer):
         # Forward pass uses this to reshape attention output before output projection
         self.embed_dim = self.num_heads * self.head_dim
 
-        # print(f'cached indices: {self.index_cache.gpu_cached_head_indices}')
-        # print(f'new indices: {tricksy_context.indices.head_indices_buffer_cpu}')
-        # print(f'cached indices shape: {self.index_cache.gpu_cached_head_indices.shape}')
-        # print(f'new indices shape: {tricksy_context.indices.head_indices_buffer_cpu.shape}')
         torch.cuda.synchronize()
         beginning = time.time()
         start = time.time()
@@ -500,39 +500,29 @@ class TricksyOPTAttention(OPTAttention, TricksyLayer):
         )
         gpu_index_diff: IndexDiff = index_diffs[0]
 
-        # print(f'off_positions: {gpu_index_diff.off_positions}')
         torch.cuda.synchronize()
-        if tricksy_context.layer == 9:
+        if self.tricksy_context.layer == 9 or self.tricksy_context.layer == 40:
             print(f'Computed off head positions and elements in {time.time() - start} seconds')
-        # print(f'new head indices shape: {tricksy_context.indices.head_indices_buffer_cpu.shape}')
-        # print(f'head off_elements.shape: {gpu_index_diff.off_elements.shape}')
-        # print(f'head off_positions.shape: {gpu_index_diff.off_positions.shape}')
-        # off_elements = torch.randperm(self.config.num_attention_heads, pin_memory=True)[:int(self.index_cache.cached_head_indices.size(0) * self.tricksy_config.adjacent_head_sparsity)]
-        # off_positions = torch.randperm(self.index_cache.cached_head_indices.size(0), pin_memory=True)[:int(self.index_cache.cached_head_indices.size(0) * self.tricksy_config.adjacent_head_sparsity)]
         torch.cuda.synchronize()
         start = time.time()
         off_positions_gpu = gpu_index_diff.off_positions.to('cuda')
         torch.cuda.synchronize()
-        if tricksy_context.layer == 9:
+        if self.tricksy_context.layer == 9 or self.tricksy_context.layer == 40:
             print(f'sent off positions to gpu in {time.time() - start} seconds')
 
         if gpu_index_diff.off_elements.size(0) == 0:
-            if tricksy_context.layer == 9:
+            if self.tricksy_context.layer == 9 or self.tricksy_context.layer == 40:
                 print(f'No new head indices, skipping load_weights')
             return
 
         cpu_index_diff: IndexDiff = index_diffs[1]
-        # print(f'cpu cached head indices: {self.index_cache.cpu_cached_head_indices}')
-        # print(f'cpu head off_elements: {cpu_index_diff.off_elements}')
-        # print(f'cpu head off_positions: {cpu_index_diff.off_positions}')
-        # print(f'cpu head on_positions: {cpu_index_diff.on_positions}')
 
         torch.cuda.synchronize()
         start = time.time()
         self.index_cache.gpu_cached_head_indices[gpu_index_diff.off_positions] = gpu_index_diff.off_elements
         self.index_cache.cpu_cached_head_indices[cpu_index_diff.off_positions] = cpu_index_diff.off_elements
         torch.cuda.synchronize()
-        if tricksy_context.layer == 9:
+        if self.tricksy_context.layer == 9 or self.tricksy_context.layer == 40:
             print(f'Updated cached head indices in {time.time() - start} seconds')
 
         # Index and overwrite the diff (much faster than full reindexing)
@@ -542,14 +532,14 @@ class TricksyOPTAttention(OPTAttention, TricksyLayer):
         start = time.time()
 
         if cpu_index_diff.off_elements.size(0) > 0:
-            if tricksy_context.layer == 9:
+            if self.tricksy_context.layer == 9 or self.tricksy_context.layer == 40:
                 print(f'cpu_index_diff.off_elements.size(0): {cpu_index_diff.off_elements.size(0)}')
             # CPU grabs missing indices from disk
             self.index_cache.indexed_weights[cpu_index_diff.off_positions].copy_(self.inputs.get_weight('self_attn.catted_head_weights')[cpu_index_diff.off_elements])
             self.index_cache.indexed_biases[cpu_index_diff.off_positions].copy_(self.inputs.get_weight('self_attn.catted_head_biases')[cpu_index_diff.off_elements])
 
         torch.cuda.synchronize()
-        if tricksy_context.layer == 9:
+        if self.tricksy_context.layer == 9 or self.tricksy_context.layer == 40:
             print(f'Indexed heads in {time.time() - start} seconds')
 
             print(f'indexed_weights is pinned: {self.index_cache.indexed_weights.is_pinned()}')
@@ -557,18 +547,17 @@ class TricksyOPTAttention(OPTAttention, TricksyLayer):
         torch.cuda.synchronize()
         start = time.time()
         # Postions where CPU already had indices GPU needs, and positions where CPU just got indices GPU needs from disk
-        if tricksy_context.layer == 9:
+        if self.tricksy_context.layer == 9 or self.tricksy_context.layer == 40:
             print(f'cpu on positions shape: {cpu_index_diff.on_positions.shape}')
             print(f'cpu off positions shape: {cpu_index_diff.off_positions.shape}')
         cpu_diff_positions = torch.cat([cpu_index_diff.on_positions, cpu_index_diff.off_positions], dim=0)
-        # print(f'cpu_diff positions shape: {cpu_diff_positions.shape}')
 
         catted_weights_diff = torch.empty((cpu_diff_positions.size(0), self.catted_weights.size(1), self.catted_weights.size(2)), dtype=torch.float16, device='cpu', pin_memory=True)
         catted_biases_diff = torch.empty((cpu_diff_positions.size(0), self.catted_biases.size(1), self.catted_biases.size(2)), dtype=torch.float16, device='cpu', pin_memory=True)
         catted_weights_diff.copy_(self.index_cache.indexed_weights[cpu_diff_positions])
         catted_biases_diff.copy_(self.index_cache.indexed_biases[cpu_diff_positions])
         torch.cuda.synchronize()
-        if tricksy_context.layer == 9:
+        if self.tricksy_context.layer == 9 or self.tricksy_context.layer == 40:
             print(f'Indexed CPU attention weights in {time.time() - start} seconds')
 
         torch.cuda.synchronize()
@@ -576,80 +565,69 @@ class TricksyOPTAttention(OPTAttention, TricksyLayer):
         self.catted_weights[off_positions_gpu].copy_(catted_weights_diff, non_blocking=True)
         self.catted_biases[off_positions_gpu].copy_(catted_biases_diff, non_blocking=True)
         torch.cuda.synchronize()
-        if tricksy_context.layer == 9:
+        if self.tricksy_context.layer == 9 or self.tricksy_context.layer == 40:
             print(f'Copied sparse attention weights in {time.time() - start} seconds')
 
-        if tricksy_context.layer == 9:
+        if self.tricksy_context.layer == 9 or self.tricksy_context.layer == 40:
             print(f'Finished loading weights in {time.time() - beginning} seconds')
         
     def forward(self, hidden_states, **kwargs):
-        # if self.tricksy_context.layer == 9 and kwargs["past_key_value"]:
-        #     if self.last_pk is not None:
-        #         print(f'past key states diff: {kwargs["past_key_value"][0][:, :, :-1, :] - self.last_pk}')
-        #         print(f'past key states shape: {kwargs["past_key_value"][0].shape}')
-        #     self.last_pk = kwargs["past_key_value"][0]
-        #     print(f'attn hidden states input shape: {hidden_states.shape}')
         if len(self.inputs.sparsity_predictors) > 2:
+        #     torch.cuda.synchronize()
+        #     start = time.time()
+        #     # Predict head sparsity based on input embedding output
+        #     self.tricksy_context.indices.head_indices_buffer_gpu = topk_and_threshold(
+        #         self.inputs.sparsity_predictors[2](hidden_states)[0, -1, :],
+        #         int(self.config.num_attention_heads * self.tricksy_config.min_head_sparsity_gpu),
+        #     )
+        #     # print(f'head indices gpu: {self.tricksy_context.indices.head_indices_buffer_gpu}')
+        #     self.tricksy_context.indices.copy_head_indices_to_cpu()
             torch.cuda.synchronize()
-            start = time.time()
-            # Predict head sparsity based on input embedding output
-            self.tricksy_context.indices.head_indices_buffer_gpu = topk_and_threshold(
-                self.inputs.sparsity_predictors[2](hidden_states)[0, -1, :],
-                int(self.config.num_attention_heads * self.tricksy_config.min_head_sparsity_gpu),
-            )
-            # print(f'head indices gpu: {self.tricksy_context.indices.head_indices_buffer_gpu}')
-            self.tricksy_context.indices.copy_head_indices_to_cpu()
-            torch.cuda.synchronize()
-            # print(f'Computed head indices based on input embeddings in {time.time() - start} seconds')
+        #     # print(f'Computed head indices based on input embeddings in {time.time() - start} seconds')
             self.load_weights(self.tricksy_context)
 
-        # Wait for weights to get to GPU
+        # # Wait for weights to get to GPU
         torch.cuda.synchronize()
-        # print(f'attn CPU weights: {self.index_cache.indexed_weights}')
 
-        start = time.time()
+        # start = time.time()
         # Predict MLP sparsity based on attention input
         mlp_sparsity = int(self.config.ffn_dim * self.tricksy_config.min_mlp_sparsity_gpu)
-        # print(f'mlp_sparsity: {mlp_sparsity}')
         self.tricksy_context.indices.mlp_indices_buffer_gpu = topk_and_threshold(
             self.inputs.sparsity_predictors[0](hidden_states)[0, -1, :],
             mlp_sparsity,
         )
         self.tricksy_context.indices.copy_mlp_indices_to_cpu()
         torch.cuda.synchronize()
-        print(f'Computed MLP indices in {time.time() - start} seconds')
-        # if self.tricksy_context.layer == 9:
-        #     torch.set_printoptions(profile='full')
-        #     print(f'Predicted top indices: {self.tricksy_context.indices.mlp_indices_buffer_cpu[:int(self.config.ffn_dim * .1)]}')
-        #     torch.set_printoptions(profile='default')
+        # if self.tricksy_context.layer == 9 or self.tricksy_context.layer == 40:
+        #     print(f'Computed MLP indices in {time.time() - start} seconds')
 
         self.inputs.next_layer.load_weights(self.tricksy_context)
 
-        torch.cuda.synchronize()
-        start = time.time()
+        # torch.cuda.synchronize()
+        # start = time.time()
         out = super().forward(self.layer_norm(hidden_states), **kwargs)
+        # Wait for MLP weights to get to GPU
         torch.cuda.synchronize()
-        # print(f'Computed attention forward in {time.time() - start} seconds')
+        # if self.tricksy_context.layer == 9 or self.tricksy_context.layer == 40:
+        #     print(f'Computed attention forward in {time.time() - start} seconds')
 
-        if self.tricksy_context.is_prompt_phase:
+        # if self.tricksy_context.is_prompt_phase:
             # Only keep sparse weights on GPU after prompt phase
-            # print(f'Head weight order: {self.index_cache.gpu_cached_head_indices}')
-            pass
             # self.catted_weights = self.catted_weights[self.index_cache.gpu_cached_head_indices.to('cuda')]
             # self.catted_biases = self.catted_biases[self.index_cache.gpu_cached_head_indices.to('cuda')]
 
-        torch.cuda.synchronize()
-        start = time.time()
-        if self.inputs.sparsity_predictors[1] is not None:
-            # Predict head sparsity based on MLP input
-            # print(f'out shape: {out[0].shape}')
-            self.tricksy_context.indices.head_indices_buffer_gpu = topk_and_threshold(
-                self.inputs.sparsity_predictors[1](out[0])[0, -1, :],
-                int(self.config.num_attention_heads * self.tricksy_config.min_head_sparsity_gpu),
-            )
-            self.tricksy_context.indices.copy_head_indices_to_cpu()
-            torch.cuda.synchronize()
-            # print(f'Computed head indices in {time.time() - start} seconds')
+        # torch.cuda.synchronize()
+        # start = time.time()
+        # if self.inputs.sparsity_predictors[1] is not None:
+        #     # Predict head sparsity based on MLP input
+        #     # print(f'out shape: {out[0].shape}')
+        #     self.tricksy_context.indices.head_indices_buffer_gpu = topk_and_threshold(
+        #         self.inputs.sparsity_predictors[1](out[0])[0, -1, :],
+        #         int(self.config.num_attention_heads * self.tricksy_config.min_head_sparsity_gpu),
+        #     )
+        #     self.tricksy_context.indices.copy_head_indices_to_cpu()
+        #     torch.cuda.synchronize()
+        #     # print(f'Computed head indices in {time.time() - start} seconds')
 
         return out
 
@@ -686,28 +664,16 @@ class TricksyOPTDecoderLayer(OPTDecoderLayer):
         self.self_attn_layer_norm = lambda x: x
 
         self.fc1_weight = self.fc2_weight = self.final_layer_norm_weight = self.fc1_bias = self.fc2_bias = self.final_layer_norm_bias = None
-        self.fc1 = lambda x: F.linear(x, self.fc1_weight, self.fc1_bias)
-        # self.fc2 = lambda x: F.linear(x, self.fc2_weight.T, self.fc2_bias)
+        self.ring_idx = 0
+        self.fc1_weight_diff = self.fc2_weight_diff = self.fc1_bias_diff = None
+        self.fc1 = lambda x: F.linear(x, torch.cat([self.fc1_weight, self.fc1_weight_diff]), torch.cat([self.fc1_bias, self.fc1_bias_diff]))
+        self.fc2 = lambda x: F.linear(x, torch.cat([self.fc2_weight, self.fc2_weight_diff]).T, self.fc2_bias)
         self.final_layer_norm = lambda x: F.layer_norm(x, (self.embed_dim,), self.final_layer_norm_weight, self.final_layer_norm_bias)
     
-    def fc2(self, x):
-        # if self.tricksy_context.layer == 9:
-            # vals, indices = torch.topk(x[-1, :], int(x.size(-1) * .1), sorted=True)
-            # torch.set_printoptions(profile='full')
-            # print(f'Actual top indices: {indices}')
-            # torch.set_printoptions(profile='default')
-
-            # torch.set_printoptions(profile='full', sci_mode=False)
-            # print(f'Computing MLP forward with fc1 weights: {self.fc1_weight[:, 0]}')
-            # torch.set_printoptions(profile='default')
-        # print(f'fc2 input shape: {x.shape}')
-
-        return F.linear(x, self.fc2_weight.T, self.fc2_bias)
-
     def load_weights(self, tricksy_context: TricksyContext):
         if self.fc1_weight is None:
-            torch.cuda.synchronize()
-            start = time.time()
+            # torch.cuda.synchronize()
+            # start = time.time()
             # Full weights for prompt phase
             fc1w = mmap_to_tensor(self.inputs.get_weight('fc1.weight')[:], pin_memory=True)
             fc1b = mmap_to_tensor(self.inputs.get_weight('fc1.bias')[:], pin_memory=True)
@@ -715,16 +681,15 @@ class TricksyOPTDecoderLayer(OPTDecoderLayer):
             fc2b = mmap_to_tensor(self.inputs.get_weight('fc2.bias')[:], pin_memory=True)
             lnw = mmap_to_tensor(self.inputs.get_weight('final_layer_norm.weight')[:], pin_memory=True)
             lnb = mmap_to_tensor(self.inputs.get_weight('final_layer_norm.bias')[:], pin_memory=True)
-            torch.cuda.synchronize()
-            # print(f'Read full MLP memmaps in {time.time() - start} seconds')
-            torch.cuda.synchronize()
-            start = time.time()
+            # torch.cuda.synchronize()
+            # torch.cuda.synchronize()
+            # start = time.time()
             self.fc1_weight, self.fc1_bias, self.fc2_weight, self.fc2_bias, self.final_layer_norm_weight, self.final_layer_norm_bias =\
                 batch_copy([fc1w, fc1b, fc2w, fc2b, lnw, lnb], tricksy_context.load_weight_stream)
-            torch.cuda.synchronize()
-            # print(f'Loaded full MLP weights in {time.time() - start} seconds')
-            proc = psutil.Process()
-            # print(f'num open files: {len(proc.open_files())}')
+            self.fc1_weight_diff = torch.tensor([], dtype=self.tricksy_config.dtype, device='cuda')
+            self.fc1_bias_diff = torch.tensor([], dtype=self.tricksy_config.dtype, device='cuda')
+            self.fc2_weight_diff = torch.tensor([], dtype=self.tricksy_config.dtype, device='cuda')
+            # torch.cuda.synchronize()
 
             index_diffs = compute_index_diffs(
                 tricksy_context.indices.mlp_indices_buffer_cpu,
@@ -733,38 +698,57 @@ class TricksyOPTDecoderLayer(OPTDecoderLayer):
             if len(index_diffs) > 0:
                 gpu_index_diff = index_diffs[0]
                 self.index_cache.gpu_cached_mlp_indices[gpu_index_diff.off_positions] = gpu_index_diff.off_elements
-            # if self.tricksy_context.layer == 9:
-            #     print(f'gpu indices after overwriting diff in prompt phase: {self.index_cache.gpu_cached_mlp_indices}')
             if len(index_diffs) > 1:
                 # CPU may not have all new indices
-                cpu_index_diff = index_diffs[1]
-                self.index_cache.cpu_cached_mlp_indices[cpu_index_diff.off_positions] = cpu_index_diff.off_elements
+                # cpu_index_diff = index_diffs[1]
+                # self.index_cache.cpu_cached_mlp_indices[cpu_index_diff.off_positions] = cpu_index_diff.off_elements
+                self.index_cache.cpu_cached_mlp_indices = torch.arange(self.config.ffn_dim, device='cpu', dtype=torch.int32)
 
-            self.index_cache.indexed_fc1_weight = fc1w[self.index_cache.cpu_cached_mlp_indices].contiguous().clone().pin_memory()
-            self.index_cache.indexed_fc1_bias = fc1b[self.index_cache.cpu_cached_mlp_indices].contiguous().clone().pin_memory()
-            self.index_cache.indexed_fc2_weight = fc2w[self.index_cache.cpu_cached_mlp_indices].contiguous().clone().pin_memory()
+            # self.index_cache.indexed_fc1_weight = fc1w[self.index_cache.cpu_cached_mlp_indices].contiguous().clone().pin_memory()
+            # self.index_cache.indexed_fc1_bias = fc1b[self.index_cache.cpu_cached_mlp_indices].contiguous().clone().pin_memory()
+            # self.index_cache.indexed_fc2_weight = fc2w[self.index_cache.cpu_cached_mlp_indices].contiguous().clone().pin_memory()
+
+            self.index_cache.indexed_fc1_weight = fc1w.contiguous().pin_memory()
+            self.index_cache.indexed_fc1_bias = fc1b.contiguous().pin_memory()
+            self.index_cache.indexed_fc2_weight = fc2w.contiguous().pin_memory()
             return
 
-        torch.cuda.synchronize()
-        beginning = time.time()
-        start = time.time()
-        index_diffs = compute_index_diffs(
-            tricksy_context.indices.mlp_indices_buffer_cpu,
-            [self.index_cache.gpu_cached_mlp_indices, self.index_cache.cpu_cached_mlp_indices]
+        # torch.cuda.synchronize()
+        # beginning = time.time()
+        # start = time.time()
+        # index_diffs = compute_index_diffs(
+        #     tricksy_context.indices.mlp_indices_buffer_cpu,
+        #     [self.index_cache.gpu_cached_mlp_indices, self.index_cache.cpu_cached_mlp_indices]
+        # )
+        gpu_index_diff: IndexDiff = IndexDiff(
+            off_elements=torch.tensor(
+                list(set(tricksy_context.indices.mlp_indices_buffer_cpu.tolist()).difference(set(self.index_cache.gpu_cached_mlp_indices.tolist()))),
+                device='cpu',
+                dtype=torch.int32,
+                pin_memory=True
+            )
         )
-        if len(index_diffs) == 0 or index_diffs[0].off_elements.size(0) == 0:
-            if tricksy_context.layer == 9:
-                print(f'No new MLP indices, skipping load_weights')
+        # print(f'gpu_index_diff.off_elements: {gpu_index_diff.off_elements}')
+        # print(f'GPU indices before overwriting diff: {self.index_cache.gpu_cached_mlp_indices}')
+        # print(f'new mlp indices: {tricksy_context.indices.mlp_indices_buffer_cpu}')
+        if gpu_index_diff.off_elements.size(0) == 0:
+        # if len(index_diffs) == 0 or index_diffs[0].off_elements.size(0) == 0:
+            self.fc1_weight_diff = torch.tensor([], dtype=self.tricksy_config.dtype, device='cuda')
+            self.fc1_bias_diff = torch.tensor([], dtype=self.tricksy_config.dtype, device='cuda')
+            self.fc2_weight_diff = torch.tensor([], dtype=self.tricksy_config.dtype, device='cuda')
+            # if self.tricksy_context.layer == 9 or self.tricksy_context.layer == 40:
+            #     print(f'No new MLP indices, skipping load_weights')
             return
 
-        gpu_index_diff: IndexDiff = index_diffs[0]
-        cpu_index_diff: IndexDiff = index_diffs[1]
-        cpu_diff_positions = torch.cat([cpu_index_diff.on_positions, cpu_index_diff.off_positions], dim=0)
+        # gpu_index_diff: IndexDiff = index_diffs[0]
+        # cpu_index_diff: IndexDiff = index_diffs[1]
+        # cpu_diff_positions = torch.cat([cpu_index_diff.on_positions, cpu_index_diff.off_positions], dim=0)
+        cpu_diff_positions = gpu_index_diff.off_elements
 
-        torch.cuda.synchronize()
-        if tricksy_context.layer == 9:
-            print(f'Computed MLP off positions and elements in {time.time() - start} seconds')
-            # print(f'GPU indices after overwriting diff: {self.index_cache.gpu_cached_mlp_indices}')
+        # torch.cuda.synchronize()
+        # if self.tricksy_context.layer == 9 or self.tricksy_context.layer == 40:
+        #     print(f'Computed MLP off positions and elements in {time.time() - start} seconds')
+            # print(f'GPU indices before overwriting diff: {self.index_cache.gpu_cached_mlp_indices}')
             # print(f'new mlp indices: {tricksy_context.indices.mlp_indices_buffer_cpu}')
             # print(f'gpu index diff: {gpu_index_diff}')
         # print(f'new mlp indices shape: {tricksy_context.indices.mlp_indices_buffer_cpu.shape}')
@@ -778,14 +762,23 @@ class TricksyOPTDecoderLayer(OPTDecoderLayer):
         # torch.cuda.synchronize()
         # print(f'sent MLP off positions to gpu in {time.time() - start} seconds')
 
-        torch.cuda.synchronize()
-        start = time.time()
-        self.index_cache.cpu_cached_mlp_indices[cpu_index_diff.off_positions] = cpu_index_diff.off_elements
-        self.index_cache.gpu_cached_mlp_indices[gpu_index_diff.off_positions] = self.index_cache.cpu_cached_mlp_indices[cpu_diff_positions]
-        # self.index_cache.gpu_cached_mlp_indices[gpu_index_diff.off_positions] = gpu_index_diff.off_elements
-        torch.cuda.synchronize()
-        if tricksy_context.layer == 9:
-            print(f'Updated MLP cached indices in {time.time() - start} seconds')
+        # torch.cuda.synchronize()
+        # start = time.time()
+        # self.index_cache.cpu_cached_mlp_indices[cpu_index_diff.off_positions] = cpu_index_diff.off_elements
+        # self.index_cache.gpu_cached_mlp_indices[gpu_index_diff.off_positions] = self.index_cache.cpu_cached_mlp_indices[cpu_diff_positions]
+        new_ring_idx = (self.ring_idx + cpu_diff_positions.size(0)) % self.index_cache.gpu_cached_mlp_indices.size(0)
+        if new_ring_idx > self.ring_idx:
+            # single contiguous update
+            self.index_cache.gpu_cached_mlp_indices[self.ring_idx:new_ring_idx] = self.index_cache.cpu_cached_mlp_indices[cpu_diff_positions]
+        elif cpu_diff_positions.size(0) > 0:
+            split = self.index_cache.gpu_cached_mlp_indices.size(0) - self.ring_idx
+            # end of ring
+            self.index_cache.gpu_cached_mlp_indices[self.ring_idx:] = self.index_cache.cpu_cached_mlp_indices[cpu_diff_positions][:split]
+            # beginning of ring
+            self.index_cache.gpu_cached_mlp_indices[:new_ring_idx] = self.index_cache.cpu_cached_mlp_indices[cpu_diff_positions][split:]
+        # torch.cuda.synchronize()
+        # if self.tricksy_context.layer == 9 or self.tricksy_context.layer == 40:
+        #     print(f'Updated MLP cached indices in {time.time() - start} seconds')
             # print(f'new gpu mlp indices: {self.index_cache.gpu_cached_mlp_indices}')
             # print(f'cpu index diff: {cpu_index_diff}')
 
@@ -793,19 +786,19 @@ class TricksyOPTDecoderLayer(OPTDecoderLayer):
         #   e.g. adjacent tokens in 1.3b layer 5 have ~90% overlap of sparse indices
         #        adjacent tokens in 1.3b layer 19 have ~60% overlap of sparse indices
         # so tricksy!
-        torch.cuda.synchronize()
-        start = time.time()
+        # torch.cuda.synchronize()
+        # start = time.time()
 
-        if cpu_index_diff.off_elements.size(0) > 0:
+        # if cpu_index_diff.off_elements.size(0) > 0:
             # CPU grabs missing indices from disk
             # TODO - broken copy
-            self.index_cache.indexed_fc1_weight[cpu_index_diff.off_positions].copy_(self.inputs.get_weight('fc1.weight')[cpu_index_diff.off_elements])
-            self.index_cache.indexed_fc1_bias[cpu_index_diff.off_positions].copy_(self.inputs.get_weight('fc1.bias')[cpu_index_diff.off_elements])
-            self.index_cache.indexed_fc2_weight[cpu_index_diff.off_positions].copy_(self.inputs.get_weight('fc2.weight')[cpu_index_diff.off_elements])
+            # self.index_cache.indexed_fc1_weight[cpu_index_diff.off_positions].copy_(self.inputs.get_weight('fc1.weight')[cpu_index_diff.off_elements])
+            # self.index_cache.indexed_fc1_bias[cpu_index_diff.off_positions].copy_(self.inputs.get_weight('fc1.bias')[cpu_index_diff.off_elements])
+            # self.index_cache.indexed_fc2_weight[cpu_index_diff.off_positions].copy_(self.inputs.get_weight('fc2.weight')[cpu_index_diff.off_elements])
 
-        torch.cuda.synchronize()
-        if tricksy_context.layer == 9:
-            print(f'Indexed disk MLP weights in {time.time() - start} seconds')
+        # torch.cuda.synchronize()
+        # if self.tricksy_context.layer == 9 or self.tricksy_context.layer == 40:
+        #     print(f'Indexed disk MLP weights in {time.time() - start} seconds')
             # torch.set_printoptions(profile='full', sci_mode=False)
             # print(f'Expecting indices: {self.tricksy_context.indices.mlp_indices_buffer_cpu}')
             # print(f'Expecting fc1 weights: {self.inputs.get_weight("fc1.weight")[self.tricksy_context.indices.mlp_indices_buffer_cpu][:, 0]}')
@@ -814,68 +807,111 @@ class TricksyOPTDecoderLayer(OPTDecoderLayer):
         # print(f'indexed_fc1_bias is pinned: {self.index_cache.indexed_fc1_bias.is_pinned()}')
         # print(f'indexed_fc2_weight is pinned: {self.index_cache.indexed_fc2_weight.is_pinned()}')
 
-        torch.cuda.synchronize()
-        start = time.time()
-        if tricksy_context.layer == 9:
-            print(f'MLP CPU diff shape: {cpu_diff_positions.shape}')
-        fc1w_diff = torch.empty((cpu_diff_positions.size(0), self.config.hidden_size), dtype=self.tricksy_config.dtype, device='cuda')
-        fc1b_diff = torch.empty((cpu_diff_positions.size(0)), dtype=self.tricksy_config.dtype, device='cuda')
-        fc2w_diff = torch.empty((cpu_diff_positions.size(0), self.config.hidden_size), dtype=self.tricksy_config.dtype, device='cuda')
-        fc1w_diff.copy_(self.index_cache.indexed_fc1_weight[cpu_diff_positions], non_blocking=True)
-        fc1b_diff.copy_(self.index_cache.indexed_fc1_bias[cpu_diff_positions], non_blocking=True)
-        fc2w_diff.copy_(self.index_cache.indexed_fc2_weight[cpu_diff_positions], non_blocking=True)
-        torch.cuda.synchronize()
-        if tricksy_context.layer == 9:
-            print(f'Indexed cpu MLP weights and copied to GPU in {time.time() - start} seconds')
-        #     torch.set_printoptions(profile='full', sci_mode=False)
-        #     print(f'GPU fc1 weights before copying diff: {self.fc1_weight[:, 0]}')
-        #     torch.set_printoptions(profile='default')
+        # print(f'MLP CPU diff shape: {cpu_diff_positions.shape}')
+        # if self.tricksy_context.layer == 9 or self.tricksy_context.layer == 40:
+        #     print(f'MLP CPU diff: {cpu_diff_positions.sort()[0]}')
+        # torch.cuda.synchronize()
+        # start = time.time()
+        self.fc1_weight_diff = torch.empty((cpu_diff_positions.size(0), self.config.hidden_size), dtype=self.tricksy_config.dtype, device='cuda')
+        self.fc1_bias_diff = torch.empty((cpu_diff_positions.size(0)), dtype=self.tricksy_config.dtype, device='cuda')
+        self.fc2_weight_diff = torch.empty((cpu_diff_positions.size(0), self.config.hidden_size), dtype=self.tricksy_config.dtype, device='cuda')
+        fc1wd = self.index_cache.indexed_fc1_weight[cpu_diff_positions]
+        fc1bd = self.index_cache.indexed_fc1_bias[cpu_diff_positions]
+        fc2wd = self.index_cache.indexed_fc2_weight[cpu_diff_positions]
+        # torch.cuda.synchronize()
+        # if self.tricksy_context.layer == 9 or self.tricksy_context.layer == 40:
+        #     print(f'Indexed cpu MLP weights in {time.time() - start} seconds')
+        # torch.cuda.synchronize()
+        # start = time.time()
+        fc1wd = fc1wd.pin_memory()
+        fc1bd = fc1bd.pin_memory()
+        fc2wd = fc2wd.pin_memory()
+        # torch.cuda.synchronize()
+        # if self.tricksy_context.layer == 9 or self.tricksy_context.layer == 40:
+        #     print(f'Pinned memory in {time.time() - start} seconds')
+        # torch.cuda.synchronize()
+        # start = time.time()
+        self.fc1_weight_diff.copy_(fc1wd, non_blocking=True)
+        self.fc1_bias_diff.copy_(fc1bd, non_blocking=True)
+        self.fc2_weight_diff.copy_(fc2wd, non_blocking=True)
+        # torch.cuda.synchronize()
+        # if self.tricksy_context.layer == 9 or self.tricksy_context.layer == 40:
+        #     print(f'copied to GPU in {time.time() - start} seconds')
+            # torch.set_printoptions(profile='full', sci_mode=False)
+            # print(f'GPU fc1 weights before copying diff: {self.fc1_weight[:, 0]}')
+            # torch.set_printoptions(profile='default')
 
-        torch.cuda.synchronize()
-        start = time.time()
-        # self.fc1_weight[gpu_index_diff.off_positions].copy_(fc1w_diff, non_blocking=True)
-        self.fc1_weight.index_copy_(0, gpu_index_diff.off_positions.to('cuda'), fc1w_diff)
-        # self.fc1_bias[gpu_index_diff.off_positions].copy_(fc1b_diff, non_blocking=True)
-        self.fc1_bias.index_copy_(0, gpu_index_diff.off_positions.to('cuda'), fc1b_diff)
-        # self.fc2_weight[gpu_index_diff.off_positions].copy_(fc2w_diff, non_blocking=True)
-        self.fc2_weight.index_copy_(0, gpu_index_diff.off_positions.to('cuda'), fc2w_diff)
-        torch.cuda.synchronize()
-        if tricksy_context.layer == 9:
+        # torch.cuda.synchronize()
+        # start = time.time()
+        # self.fc1_weight[gpu_index_diff.off_positions].copy_(self.index_cache.indexed_fc1_weight[cpu_diff_positions], non_blocking=True)
+        # self.fc1_weight.index_copy_(0, gpu_index_diff.off_positions.to('cuda'), fc1w_diff)
+        # self.fc1_bias[gpu_index_diff.off_positions].copy_(self.index_cache.indexed_fc1_bias[cpu_diff_positions], non_blocking=True)
+        # self.fc1_bias.index_copy_(0, gpu_index_diff.off_positions.to('cuda'), fc1b_diff)
+        # self.fc2_weight[gpu_index_diff.off_positions].copy_(self.index_cache.indexed_fc2_weight[cpu_diff_positions], non_blocking=True)
+        # self.fc2_weight.index_copy_(0, gpu_index_diff.off_positions.to('cuda'), fc2w_diff)
+        # torch.cuda.synchronize()
+        # if self.tricksy_context.layer == 9 or self.tricksy_context.layer == 40:
             # torch.set_printoptions(profile='full', sci_mode=False)
             # print(f'GPU indices after overwriting diff: {self.index_cache.gpu_cached_mlp_indices}')
-            # print(f'GPU fc1 weights after copying diff: {self.fc1_weight[:, 0]}')
+            # print(f'GPU fc1 weights after copying diff: {torch.cat([self.fc1_weight, self.fc1_weight_diff])[:, 0]}')
             # torch.set_printoptions(profile='default')
-            weight_diff = torch.sum((self.fc1_weight[:, 0]).cpu().sort()[0] - self.inputs.get_weight("fc1.weight")[self.tricksy_context.indices.mlp_indices_buffer_cpu][:, 0].sort()[0])
-            if weight_diff > 0.001:
-                raise Exception(f'fc1 weight diff is non-zero: {weight_diff}')
-            print(f'Applied sparse mlp weight diff on GPU in {time.time() - start} seconds')
-            print(f'Finished loading MLP weights in {time.time() - beginning} seconds')
+            # print(f'Finished loading MLP weights in {time.time() - beginning} seconds')
+            # actual = (torch.cat([self.fc1_weight, self.fc1_weight_diff])[:, 0]).cpu()
+            # expected = self.inputs.get_weight("fc1.weight")[self.tricksy_context.indices.mlp_indices_buffer_cpu][:, 0]
+            # weight_diff = torch.count_nonzero(~torch.isin(expected, actual))
+            # if weight_diff > 1:
+            #     raise Exception(f'fc1 weight diff is non-zero: {weight_diff}')
+            # print(f'Applied sparse mlp weight diff on GPU in {time.time() - start} seconds')
 
     def forward(self, *args, **kwargs):
         torch.cuda.synchronize()
+        # start = time.time()
         
-        print(f'=== Layer {self.tricksy_context.layer} ===')
+        # print(f'=== Layer {self.tricksy_context.layer} ===')
         self.inputs.next_layer.load_weights(self.tricksy_context)
 
-        torch.cuda.synchronize()
-        start = time.time()
+        # torch.cuda.synchronize()
+        # start = time.time()
         out = super().forward(*args, **kwargs)
-        torch.cuda.synchronize()
-        if self.tricksy_context.layer == 9:
-            print(f'Computed Attention + MLP forward in {time.time() - start} seconds')
+        # torch.cuda.synchronize()
+        # print(f'Computed Attention + MLP forward in {time.time() - start} seconds')
+        # if self.tricksy_context.layer == 9 or self.tricksy_context.layer == 40:
             # print(f'Decoder layer out: {out}')
 
         if self.tricksy_config.full_offload:
             self.fc1_weight = self.fc2_weight = self.final_layer_norm_weight = self.fc1_bias = self.fc2_bias = self.final_layer_norm_bias = None
         elif self.tricksy_context.is_prompt_phase:
-            # if self.tricksy_context.layer == 9:
+            # if self.tricksy_context.layer == 9 or self.tricksy_context.layer == 40:
             #     print(f'gpu indices keeping sparse weights in prompt phase: {self.index_cache.gpu_cached_mlp_indices}')
             # Only keep sparse weights on GPU after prompt phase
             self.fc1_weight = self.fc1_weight[self.index_cache.gpu_cached_mlp_indices.to('cuda')]
             self.fc1_bias = self.fc1_bias[self.index_cache.gpu_cached_mlp_indices.to('cuda')]
             self.fc2_weight = self.fc2_weight[self.index_cache.gpu_cached_mlp_indices.to('cuda')]
 
-            # if self.tricksy_context.layer == 9:
+        # Update ring buffers
+        # torch.cuda.synchronize()
+        # start = time.time()
+        if not self.tricksy_config.full_offload:
+            prev_ring_idx = self.ring_idx
+            self.ring_idx = (self.ring_idx + self.fc1_weight_diff.size(0)) % self.fc1_weight.size(0)
+            if self.ring_idx > prev_ring_idx:
+                self.fc1_weight[prev_ring_idx:self.ring_idx] = self.fc1_weight_diff
+                self.fc1_bias[prev_ring_idx:self.ring_idx] = self.fc1_bias_diff
+                self.fc2_weight[prev_ring_idx:self.ring_idx] = self.fc2_weight_diff
+            elif self.fc1_weight_diff.size(0) > 0:
+                split = self.fc1_weight_diff.size(0) - self.ring_idx
+                self.fc1_weight[prev_ring_idx:] = self.fc1_weight_diff[:split]
+                self.fc1_weight[:self.ring_idx] = self.fc1_weight_diff[split:]
+                self.fc1_bias[prev_ring_idx:] = self.fc1_bias_diff[:split]
+                self.fc1_bias[:self.ring_idx] = self.fc1_bias_diff[split:]
+                self.fc2_weight[prev_ring_idx:] = self.fc2_weight_diff[:split]
+                self.fc2_weight[:self.ring_idx] = self.fc2_weight_diff[split:]
+        self.fc1_weight_diff = self.fc2_weight_diff = self.fc1_bias_diff = None
+        # torch.cuda.synchronize()
+        # if self.tricksy_context.layer == 9 or self.tricksy_context.layer == 40:
+        #     print(f'Updated ring buffers in {time.time() - start} seconds')
+
+            # if self.tricksy_context.layer == 9 or self.tricksy_context.layer == 40:
             #     torch.set_printoptions(profile='full', sci_mode=False)
             #     print(f'fc1 after sparse weight index in prompt phase: {self.fc1_weight[:, 0]}')
             #     torch.set_printoptions(profile='default')
@@ -1019,6 +1055,7 @@ class TricksyOPTForCausalLM(OPTForCausalLM, TricksyLayer):
         start = time.time()
         out = super().forward(*args, **kwargs)
         torch.cuda.synchronize()
+        self.tricksy_context.forward_times.append(time.time() - start)
         print(f'Full forward in {time.time() - start} seconds')
         self.tricksy_context.layer = 0
         return out
@@ -1027,4 +1064,6 @@ class TricksyOPTForCausalLM(OPTForCausalLM, TricksyLayer):
         # Load input embeddings for first token
         self.model.decoder.load_weights(self.tricksy_context)
         torch.cuda.synchronize()
-        return super().generate(*args, **kwargs)
+        out = super().generate(*args, **kwargs)
+        print(f'\n===\nDecoding tok/s: {1 / (sum(self.tricksy_context.forward_times[1:]) / (len(self.tricksy_context.forward_times) - 1))}')
+        return out

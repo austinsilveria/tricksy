@@ -87,7 +87,7 @@ def parallel_memmap_read(memmap, num_threads=8):
 # compute the diff at each level of the hierarchy.
 #   e.g. the first loop computes the indices that the GPU does not have,
 #        and the second loop computes the indices *of that diff* that the CPU does not have.
-def compute_index_diffs(new_indices: torch.Tensor, cached_indices_list: List[torch.Tensor]):
+def compute_index_diffs(new_indices: torch.Tensor, cached_indices_list: List[torch.Tensor], pin_memory=True):
     diffs = []
     current_diff = new_indices
     for cached_indices in cached_indices_list:
@@ -101,7 +101,7 @@ def compute_index_diffs(new_indices: torch.Tensor, cached_indices_list: List[tor
             list(set(current_diff.tolist()).difference(set(cached_indices.tolist()))),
             device='cpu',
             dtype=torch.int32,
-            pin_memory=True
+            pin_memory=pin_memory
         )
         # Compute mask of current indices where new indices does not contain the element
         on_position_mask = torch.isin(cached_indices, current_diff, assume_unique=True)

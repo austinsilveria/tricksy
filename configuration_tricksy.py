@@ -10,17 +10,17 @@ class TricksyConfig:
     min_embedding_probability: float = 0.05
 
     # Percentage of weights to keep in each layer
-    min_mlp_sparsity_gpu: float = .2
-    min_mlp_sparsity_cpu: float = .65
+    min_mlp_sparsity_gpu: float = .15
+    min_mlp_sparsity_cpu: float = 1
     min_mlp_probability: float = 1
     # Testing
     adjacent_mlp_sparsity: float = 0
 
-    min_head_sparsity_gpu: float = .5
+    min_head_sparsity_gpu: float = 1
     min_head_sparsity_cpu: float = 1
     min_head_probability: float = 1
     # Testing
     adjacent_head_sparsity: float = 0
 
-    full_offload: bool = True
+    full_offload: bool = False
     dtype: torch.dtype = torch.float16
