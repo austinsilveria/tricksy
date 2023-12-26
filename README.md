@@ -59,7 +59,7 @@ MLP layers of large language models are naturally sparse--e.g. > 99% of layer 3'
 We exploit this natural sparisity to minimize CPU-GPU data transfer.
 
 At **initialization**, we:
-1. Store a subset of each MLP layer (e.g. 30%) and full attention layers on the GPU
+1. Store a subset of each MLP layer (e.g. 30%) and full attention layers on the GPU (similar to [LLM in a flash](https://arxiv.org/abs/2312.11514))
 2. Store full MLP layers in CPU RAM
 3. Store a cache of which neuron indices we currently have on the GPU
 
