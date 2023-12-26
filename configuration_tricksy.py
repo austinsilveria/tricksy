@@ -6,21 +6,13 @@ from transformers.models.opt.configuration_opt import OPTConfig
 class TricksyConfig:
     opt_config: OPTConfig
 
-    min_embedding_sparsity: float = 0.05
-    min_embedding_probability: float = 0.05
-
-    # Percentage of weights to keep in each layer
-    min_mlp_sparsity_gpu: float = .15
+    # Percentage of weights to keep on each device
+    # e.g. 30% of each MLP layer on GPU
+    min_mlp_sparsity_gpu: float = .3
+    # e.g. 100% of each MLP layer on CPU
     min_mlp_sparsity_cpu: float = 1
-    min_mlp_probability: float = 1
-    # Testing
-    adjacent_mlp_sparsity: float = 0
 
-    min_head_sparsity_gpu: float = 1
-    min_head_sparsity_cpu: float = 1
-    min_head_probability: float = 1
-    # Testing
-    adjacent_head_sparsity: float = 0
-
+    # If true, cleans up layer's weights after computing forward pass
     full_offload: bool = False
+
     dtype: torch.dtype = torch.float16
