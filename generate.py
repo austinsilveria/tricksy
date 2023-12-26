@@ -1,8 +1,8 @@
 import torch
 from transformers import AutoTokenizer, set_seed
 
-from modeling_tricksy import TricksyOPTForCausalLM, OPTDiskWeights
-from configuration_tricksy import TricksyConfig
+from tricksy.modeling_tricksy import TricksyOPTForCausalLM, OPTDiskWeights
+from tricksy.configuration_tricksy import TricksyConfig
 
 set_seed(42)
 

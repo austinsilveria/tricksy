@@ -20,8 +20,8 @@ from transformers.models.opt.modeling_opt import (
 from transformers.models.opt.configuration_opt import OPTConfig
 from huggingface_hub import snapshot_download
 
-from configuration_tricksy import TricksyConfig
-from util import batch_copy, compute_index_diffs, load_mlp_sparsity_predictor, mmap_to_tensor, topk_and_threshold
+from tricksy.configuration_tricksy import TricksyConfig
+from tricksy.util import batch_copy, compute_index_diffs, load_mlp_sparsity_predictor, mmap_to_tensor, topk_and_threshold
 
 TRICKSY_WEIGHTS_PATH = 'tricksy-weights/'
 
