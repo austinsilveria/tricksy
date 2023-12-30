@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tricksy"
+version = "0.1"
+description = "Fast approximate inference on a single GPU with sparsity aware offloading."
+readme = "README.md"
+requires-python = ">=3.7"
+classifiers = [
+    "Programming Language :: Python :: 3",
+]
+dependencies = [
+    "torch>=2.0", "transformers>=4.35", "accelerate>=0.24", "numpy"
+]
+
+[project.urls]
+"Homepage" = "https://github.com/austinsilveria/tricksy"
+"Bug Tracker" = "https://github.com/austinsilveria/tricksy/issues"

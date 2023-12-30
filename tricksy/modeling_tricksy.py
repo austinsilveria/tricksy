@@ -376,7 +376,7 @@ class TricksyOPTDecoderLayer(OPTDecoderLayer):
         self.final_layer_norm = lambda x: F.layer_norm(x, (self.embed_dim,), self.final_layer_norm_weight, self.final_layer_norm_bias)
     
     def load_weights(self, tricksy_context: TricksyContext):
-        if self.fc1_weight is None:
+        if self.tricksy_context.is_prompt_phase:
             # Full weights for prompt phase
             fc1w = mmap_to_tensor(self.inputs.get_weight('fc1.weight')[:], pin_memory=True)
             fc1b = mmap_to_tensor(self.inputs.get_weight('fc1.bias')[:], pin_memory=True)
@@ -400,6 +400,15 @@ class TricksyOPTDecoderLayer(OPTDecoderLayer):
             self.index_cache.indexed_fc1_bias = fc1b.contiguous().pin_memory()
             self.index_cache.indexed_fc2_weight = fc2w.contiguous().pin_memory()
             return
+        elif self.fc1_weight is None:
+            # Full weights if full offload
+            self.fc1_weight, self.fc1_bias, self.fc2_weight = batch_copy(
+                [self.index_cache.indexed_fc1_weight, self.index_cache.indexed_fc1_bias, self.index_cache.indexed_fc2_weight],
+                tricksy_context.load_weight_stream
+            )
+            self.fc1_weight_diff = torch.tensor([], dtype=self.tricksy_config.dtype, device='cuda')
+            self.fc1_bias_diff = torch.tensor([], dtype=self.tricksy_config.dtype, device='cuda')
+            self.fc2_weight_diff = torch.tensor([], dtype=self.tricksy_config.dtype, device='cuda')
 
         off_elements = torch.tensor(
             list(set(tricksy_context.indices.mlp_indices_buffer_cpu.tolist()).difference(set(self.index_cache.gpu_cached_mlp_indices.tolist()))),
@@ -445,7 +454,7 @@ class TricksyOPTDecoderLayer(OPTDecoderLayer):
         out = super().forward(*args, **kwargs)
 
         if self.tricksy_config.full_offload:
-            self.fc1_weight = self.fc2_weight = self.final_layer_norm_weight = self.fc1_bias = self.fc2_bias = self.final_layer_norm_bias = None
+            self.fc1_weight = self.fc1_bias = self.fc2_weight = None
         elif self.tricksy_context.is_prompt_phase:
             # Only keep sparse MLP weights on GPU after prompt phase
             self.fc1_weight = self.fc1_weight[self.index_cache.gpu_cached_mlp_indices.to('cuda')]
@@ -606,5 +615,4 @@ class TricksyOPTForCausalLM(OPTForCausalLM, TricksyLayer):
         self.model.decoder.load_weights(self.tricksy_context)
         torch.cuda.synchronize()
         out = super().generate(*args, **kwargs)
-        print(f'\n===\nDecoding tok/s: {1 / (sum(self.tricksy_context.forward_times[1:]) / (len(self.tricksy_context.forward_times) - 1))}\n===\n')
         return out
