@@ -2,55 +2,59 @@
 Fast approximate inference on a single GPU with sparsity aware offloading
 * ~15x faster than naive offloading
 * ~7x faster than partial dense offloading with same GPU memory usage
+* 58% of model size in GPU memory
+* [HuggingFace Space](https://huggingface.co/spaces/austinsilveria/tricksy)
 
 ```python
 import torch
-from transformers import AutoTokenizer, set_seed
+from transformers import AutoTokenizer, TextStreamer, set_seed
 
 from tricksy.modeling_tricksy import TricksyOPTForCausalLM, OPTDiskWeights
 from tricksy.configuration_tricksy import TricksyConfig
 
 set_seed(42)
 
-# 60 GB (16 bit)
-model_name = 'facebook/opt-30b'
+# 13.4 GB (16 bit)
+model_name = 'facebook/opt-6.7b'
 disk_weights = OPTDiskWeights(model_name)
 tricksy_model = TricksyOPTForCausalLM(TricksyConfig(disk_weights.config), disk_weights)
 tokenizer = AutoTokenizer.from_pretrained(model_name)
+streamer = TextStreamer(tokenizer, skip_special_tokens=True)
 
 prompt = 'Making pesto from scratch can be done with these ingredients in 4 simple steps:\nStep 1'
 inputs = tokenizer(prompt, return_tensors='pt')
 
-generate_ids = tricksy_model.generate(inputs.input_ids.to('cuda'), max_length=100, do_sample=True, top_k=50, top_p=0.9)
-print(f'\n{(tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False))[0]}')
+print()
+tricksy_model.generate(inputs.input_ids.to('cuda'), max_new_tokens=100, do_sample=True, top_k=50, top_p=0.9, streamer=streamer)
 
-print(f'\n===\nCurrent GPU mem usage: {torch.cuda.memory_allocated("cuda") / 1024 ** 3} GB')
-print(f'Max GPU mem usage: {torch.cuda.max_memory_allocated("cuda") / 1024 ** 3} GB')
+print(f'\n===\nDecoding tok/s: {1 / (sum(tricksy_model.tricksy_context.forward_times[1:]) / (len(tricksy_model.tricksy_context.forward_times) - 1))}')
+print(f'Current GPU mem usage: {torch.cuda.memory_allocated("cuda") / 1024 ** 3} GB')
+print(f'Max GPU mem usage: {torch.cuda.max_memory_allocated("cuda") / 1024 ** 3} GB\n===')
 ```
 ~~~
-===
-Decoding tok/s: 3.7130587408915883
-===
-
-
 Making pesto from scratch can be done with these ingredients in 4 simple steps:
-Step 1: Put the raw pine nuts in the food processor.
-Step 2: Add the basil and 1/2 cup of the parmesan.
-Step 3: Add a little water to blend.
-Step 4: Blend for 30 seconds.
+Step 1: Cut up the veggies into thin strips and mix with a little salt and pepper.
+Step 2: Mix it all up in your food processor.
+Step 3: You can also add nuts and other dried herbs at this point.
+Step 4: Add in the Parmesan, salt and pepper and pulse.
 
-It’s that simple! The pine nuts bring a great texture to the pesto, making it super tasty and creamy. If you like
+I usually make mine into 4 small containers and just have to pop them into the fridge for a few hours.
+
+
+It's a delicious, easy way to add tons
 
 ===
-Current GPU mem usage: 33.99628019332886 GB
-Max GPU mem usage: 34.945725440979004 GB
+Decoding tok/s: 6.61597540779115
+Current GPU mem usage: 8.431373119354248 GB
+Max GPU mem usage: 8.743545532226562 GB
+===
 ~~~
 
 ### Usage
 ```bash
 git clone https://github.com/austinsilveria/tricksy.git
-cd tricksy
-python3 generate.py
+pip install -e tricksy/
+python3 -m tricksy.generate
 ```
 
 ### Description
