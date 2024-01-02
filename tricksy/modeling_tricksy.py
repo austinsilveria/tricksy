@@ -208,7 +208,6 @@ class TricksyLayerInputs:
         sparsity_predictors: List[Callable[[torch.Tensor], torch.Tensor]] = None,
     ) -> None:
         self.disk_weights = disk_weights
-        # self.get_weight = lambda key: self.disk_weights.load_memmap_weight(f'{layer_key_prefix}{key}')
         self.get_weight = lambda key: self.disk_weights.memmap_weights[(f'{layer_key_prefix}{key}')]
         self.layer_key_prefix = layer_key_prefix
         self.next_layer = next_layer
