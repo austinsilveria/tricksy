@@ -68,7 +68,7 @@ At **initialization**, we:
 3. Store a cache of which neuron indices we currently have on the GPU
 
 **Before each** decoder layer's **foward pass**, we:
-1. Predict active MLP neurons based on the attention layer input (following [Deja Vu](https://proceedings.mlr.press/v202/liu23am/liu23am.pdf))
+1. Predict active MLP neurons based on the attention layer input (following [Deja Vu](https://proceedings.mlr.press/v202/liu23am/liu23am.pdf)--see their [repository](https://github.com/FMInference/DejaVu/blob/master/sparse_predictor/trainer_mlp.py) for training the sparsity predictor)
 
 **During** each decoder layer's **attention** computation, we, asynchronously on the CPU:
 1. Compute the difference between the set of predicted active neuron indices and the set of neuron indices we currently have on the GPU
