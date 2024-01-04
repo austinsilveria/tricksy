@@ -58,7 +58,7 @@ python3 -m tricksy.generate
 ```
 
 ### Description
-MLP layers of large language models are naturally sparse--e.g. > 99% of layer 3's and > 90% of layer 20's neurons in OPT-1.3b have no effect (due to relu) for most inputs. Adjacent tokens also share a significant number of active neurons--e.g. for layers 1-7 of OPT-1.3b, > 90% of neurons active for token k are also active for token k + 1 (and 60-65% for layers 20-23).
+MLP layers of large language models are naturally sparse--e.g. > 99% of layer 3's and > 90% of layer 20's neurons in OPT-1.3b have no effect due to relu for most inputs (other models without relu can still potentially have a large number of neurons with neglible output norm, meaning they will contribute very little to the total residual). Adjacent tokens also share a significant number of active neurons--e.g. for layers 1-7 of OPT-1.3b, > 90% of neurons active for token k are also active for token k + 1 (and 60-65% for layers 20-23).
 
 We exploit this natural sparsity to minimize CPU-GPU data transfer.
 
@@ -86,7 +86,7 @@ And finally, **during** each decoder layer's **MLP** computation, we:
 
 ### Limitations
 1. This is approximate inference. The active neuron predictors do not have perfect recall, leading to slight accuracy degradation. See the [Deja Vu paper](https://proceedings.mlr.press/v202/liu23am/liu23am.pdf) for an in depth evaluation.
-2. Takes advantage of relu, which not all models use.
+2. Takes advantage of relu, which not all models use. However, similar to how [Deja Vu](https://proceedings.mlr.press/v202/liu23am/liu23am.pdf) computes attention head sparsity by only keeping the top K heads based on output norm, we can likely apply this to models without relu by keeping the top K neurons sorted by norm. This works because independent computation dimensions (attention heads or neurons) with low norms contribute very little to the total residual.
 
 ### Potential Improvements
 1. Evaluations--to push the sparsity levels, we need evaluations to measure accuracy degradation.
